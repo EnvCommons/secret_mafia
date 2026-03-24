@@ -1,6 +1,5 @@
 import asyncio
 import textarena as ta
-import re
 import openai
 from typing import List, Tuple
 from pydantic import BaseModel
@@ -28,6 +27,7 @@ class SecretMafiaEnvironment(Environment):
     NUM_TASKS_PER_VARIANT = 50
     AGENT_PLAYER_ID = 0
     NUM_PLAYERS = 6
+    MAX_OPPONENT_STEPS = 120  # NUM_PLAYERS * 20
 
     def __init__(self, task_spec: JSONObject, secrets: dict[str, str] = {}) -> None:
         super().__init__(task_spec)
@@ -42,6 +42,7 @@ class SecretMafiaEnvironment(Environment):
         self.ta_env = ta.make(env_id=self.config.env_id)
         self.game_done = False
         self.turn_count = 0
+        self._last_obs_len = 0
 
     @classmethod
     def list_splits(cls) -> list[str]:
@@ -62,21 +63,32 @@ class SecretMafiaEnvironment(Environment):
         return tasks
 
     def _format_observation(self, observation) -> str:
+        """Format an observation without position tracking. Used for opponent observations."""
         if isinstance(observation, str):
-            match = None
-            for m in re.finditer(r'^\[(?!GAME\])[^\]]+\].*$', observation, re.MULTILINE):
-                match = m
-            if match:
-                return observation[match.end():].lstrip('\n')
-            return observation
+            return observation.strip()
         if isinstance(observation, list):
             if not observation:
                 return ""
-            last = observation[-1]
-            if isinstance(last, tuple) and len(last) >= 2:
-                return str(last[1])
-            return str(last)
+            parts = []
+            for item in observation:
+                if isinstance(item, tuple) and len(item) >= 2:
+                    sender_id, msg = item[0], str(item[1])
+                    if sender_id == -1:
+                        parts.append(f"[GAME] {msg}")
+                    else:
+                        parts.append(f"[Player {sender_id}] {msg}")
+                else:
+                    parts.append(str(item))
+            return '\n'.join(parts)
         return str(observation)
+
+    def _format_new_observation(self, observation) -> str:
+        """Format observation returning only new content since last call. Used for agent observations."""
+        if isinstance(observation, str):
+            new_content = observation[self._last_obs_len:].strip()
+            self._last_obs_len = len(observation)
+            return new_content if new_content else observation.strip()
+        return self._format_observation(observation)
 
     def _map_reward(self, ta_rewards: dict, player_id: int) -> float:
         raw = ta_rewards.get(player_id, 0)
@@ -85,8 +97,8 @@ class SecretMafiaEnvironment(Environment):
     async def _get_opponent_action(self, observation: str, player_id: int) -> str:
         system_prompt = (
             f"You are Player {player_id} in Secret Mafia. "
-            f"During discussion, send messages. For voting, respond with [vote X] where X is a player number. "
-            f"For mafia night actions, respond with [kill X]. "
+            f"During discussion, send messages. For voting, respond with [X] where X is the player number. "
+            f"For mafia night actions, respond with [Player X] where X is the target. "
             f"Respond with ONLY your message or action."
         )
         messages = [
@@ -100,10 +112,15 @@ class SecretMafiaEnvironment(Environment):
             )
             return response.choices[0].message.content.strip()
         except Exception:
-            return "[vote 0]"
+            return "[0]"
 
     async def _run_opponent_turns(self, current_player_id: int, current_observation) -> str:
+        steps = 0
         while current_player_id != self.AGENT_PLAYER_ID:
+            steps += 1
+            if steps > self.MAX_OPPONENT_STEPS:
+                self.game_done = True
+                return "Game ended: too many opponent turns without agent action."
             obs_text = current_observation if isinstance(current_observation, str) else str(current_observation)
             opponent_action = await self._get_opponent_action(obs_text, current_player_id)
             done, info = self.ta_env.step(action=opponent_action)
@@ -111,7 +128,7 @@ class SecretMafiaEnvironment(Environment):
                 self.game_done = True
                 return opponent_action
             current_player_id, current_observation = self.ta_env.get_observation()
-        return self._format_observation(current_observation)
+        return self._format_new_observation(current_observation)
 
     async def get_prompt(self) -> List[TextBlock]:
         self.ta_env.reset(num_players=self.NUM_PLAYERS, seed=self.config.seed)
@@ -120,14 +137,15 @@ class SecretMafiaEnvironment(Environment):
         if player_id != self.AGENT_PLAYER_ID:
             obs_text = await self._run_opponent_turns(player_id, observation)
         else:
-            obs_text = self._format_observation(observation)
+            obs_text = self._format_new_observation(observation)
 
         prompt = (
-            f"You are Player 0 in Secret Mafia (5 players).\n\n"
-            f"Roles: Mafia members try to eliminate civilians. Civilians try to identify and vote out Mafia.\n"
-            f"Day phase: discuss and vote to eliminate someone [vote X].\n"
-            f"Night phase: Mafia chooses a target [kill X].\n\n"
-            f"Use send_message for all actions (chat, votes, night actions).\n\n"
+            f"You are Player 0 in Secret Mafia ({self.NUM_PLAYERS} players).\n\n"
+            f"Roles: Mafia try to eliminate civilians. Civilians try to vote out Mafia.\n"
+            f"Day: discuss freely, then vote using the format shown in the observation (e.g., [X]).\n"
+            f"Night: if Mafia, choose a target using the format shown (e.g., [Player X] or [X]).\n\n"
+            f"IMPORTANT: Read each observation carefully for the exact action format required.\n"
+            f"Use send_message for all actions.\n\n"
             f"{obs_text}"
         )
         return [TextBlock(text=prompt)]
@@ -146,7 +164,7 @@ class SecretMafiaEnvironment(Environment):
 
     @tool
     async def send_message(self, params: SendMessageParams) -> ToolOutput:
-        """Send a message, vote [vote X], or night action [kill X]."""
+        """Send a message during discussion, or take an action using the exact format shown in the game observation (e.g., [X] for votes, [Player X] for night actions)."""
         if self.game_done:
             return ToolOutput(
                 blocks=[TextBlock(text="Game is already over.")],
@@ -169,19 +187,17 @@ class SecretMafiaEnvironment(Environment):
 
         player_id, observation = self.ta_env.get_observation()
         if player_id != self.AGENT_PLAYER_ID:
-            after_move_obs = self._format_observation(observation)
             obs_text = await self._run_opponent_turns(player_id, observation)
             if self.game_done:
                 summary, reward, finished = self._handle_game_end()
                 return ToolOutput(
-                    blocks=[TextBlock(text=f"After your move:\n{after_move_obs}\n\nOpponent's response:\n{obs_text}\n\n{summary}")],
+                    blocks=[TextBlock(text=f"{obs_text}\n\n{summary}")],
                     metadata={"turn": self.turn_count, "reward": reward},
                     reward=reward,
                     finished=True,
                 )
-            obs_text = f"After your move:\n{after_move_obs}\n\nAfter opponent's response:\n{obs_text}"
         else:
-            obs_text = self._format_observation(observation)
+            obs_text = self._format_new_observation(observation)
 
         return ToolOutput(
             blocks=[TextBlock(text=obs_text)],
